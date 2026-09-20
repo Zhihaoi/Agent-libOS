@@ -19,7 +19,7 @@ workspace first, rolls the filesystem back to its immutable commit, then attempt
 the legitimate in-tool restore (``CheckpointManager.restore`` refuses while the
 scheduler runs a quantum, so a model-invoked call reports
 ``libos_restore=pending_host_restore`` with a Host hint instead of bypassing
-quiescence; a Host-driven call with admin authority restores both planes).
+quiescence; a quiescent Host-driven call with admin authority restores both planes).
 """
 
 from __future__ import annotations
@@ -72,7 +72,6 @@ LIBOS_RESTORE_RESTORED = "restored"
 LIBOS_RESTORE_WARNINGS = "restored_with_warnings"
 LIBOS_RESTORE_PENDING = "pending_host_restore"
 LIBOS_RESTORE_SKIPPED = "skipped"
-_RESTORE_REFUSED_PREFIX = "refused while scheduler"
 _HOST_RESTORE_HINT = (
     "Host must run runtime.checkpoint.restore(actor, checkpoint_id, "
     "require_capability=False) for the paired checkpoint once the process is quiescent"
@@ -531,12 +530,37 @@ def _restore_libos_paired(
             runtime, pid, workspace, checkpoint_id, "restore_authority", hint
         )
     except ValidationError as exc:
-        if _RESTORE_REFUSED_PREFIX in str(exc):
-            hint = f"{_HOST_RESTORE_HINT}; scheduler refused the in-tool restore: {exc}"
-            return _pending_restore(
-                runtime, pid, workspace, checkpoint_id, "scheduler_busy", hint
+        # Only known pre-commit admission refusals are recoverable here.
+        # Snapshot and publication validation failures must still propagate.
+        detail = str(exc)
+        if (
+            detail == "checkpoint restore refused while scheduler is running"
+            or detail.startswith(
+                "checkpoint restore refused while scheduler futures are active: "
             )
-        raise
+        ):
+            reason = "scheduler_busy"
+            unblock = "Wait for the scheduler and its active futures to become idle"
+        elif detail.startswith(
+            "checkpoint restore refused while scoped ObjectTasks are active: "
+        ):
+            reason = "object_tasks_active"
+            unblock = "Host must finish or cancel active scoped ObjectTasks"
+        elif detail.startswith(
+            "checkpoint restore refused while scoped Durable TaskRuns are active: "
+        ):
+            reason = "task_runs_active"
+            unblock = "Host must finish or cancel active scoped Durable TaskRuns"
+        elif detail == "checkpoint restore or recovery is already in progress":
+            reason = "restore_busy"
+            unblock = "Wait for the current restore or recovery to finish"
+        else:
+            raise
+        hint = (
+            f"{unblock} before restoring libOS. {_HOST_RESTORE_HINT}. "
+            "The filesystem rollback has completed. Do not repeat it."
+        )
+        return _pending_restore(runtime, pid, workspace, checkpoint_id, reason, hint)
     status = str(result["status"])
     pending = bool(result["reconciliation_pending"])
     publication_id = str(result["publication_id"])
@@ -615,7 +639,8 @@ class AgentvfsRollbackArgs(BaseModel):
             "Validate the named paired libOS checkpoint, workspace, and target before "
             "rolling back to its immutable filesystem commit, then attempt its libOS "
             "restore. The libOS restore is Host-mediated when the process "
-            "lacks required checkpoint or image authority or the scheduler is running; the result "
+            "lacks required authority or the runtime is busy with scheduled work, scoped "
+            "tasks, or another restore; the result "
             "then reports libos_restore=pending_host_restore with a hint instead of "
             "restoring in-tool."
         ),
@@ -725,7 +750,8 @@ class AgentvfsRollbackTool(SyncAgentTool[AgentvfsRollbackArgs]):
         "restoring the paired immutable filesystem commit and libOS object/SQL state. "
         "When the in-tool libOS "
         "restore is not permitted (missing checkpoint or image authority) or is "
-        "refused while the scheduler runs, the filesystem rollback still stands "
+        "refused while the scheduler, scoped tasks, or another restore is active, "
+        "the filesystem rollback still stands "
         "and the result reports libos_restore=pending_host_restore so the Host "
         "can finish the second plane once the process is quiescent."
     )

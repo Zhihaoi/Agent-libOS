@@ -650,10 +650,12 @@ an in-quantum restore is refused by design; the tool then reports
 `libos_restore=pending_host_restore` with a Host hint (audited as
 `module.agentvfs.libos_restore_pending`), and the Host completes
 `CheckpointManager.restore` once the process is quiescent. With Host-granted
-checkpoint admin, any required image authority, and an idle scheduler, both
-planes restore inside the one tool call. If image authority is missing after
-filesystem rollback, the result preserves the completed filesystem commit and
-reports `pending_host_restore`; the Host finishes only the libOS restore.
+checkpoint admin, any required image authority, and a quiescent runtime, both
+planes restore inside the one tool call. If image authority is missing, scoped
+ObjectTasks or Durable TaskRuns remain active, or another restore/recovery is in
+progress after filesystem rollback, the result preserves the completed filesystem
+commit and reports `pending_host_restore`. The Host resolves the reported blocker
+and finishes only the libOS restore, without repeating the filesystem rollback.
 Restore warnings and pending reconciliation remain visible in the
 result instead of being reported as full success. Pairing records an association,
 not an atomic transaction across both systems: the Host must coordinate workspace

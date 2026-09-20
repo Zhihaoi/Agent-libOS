@@ -25,7 +25,7 @@ modules:
     - modules/agentvfs/module.yaml
   trusted_modules:
     - agent-libos-pty:v0:2bafedf56f29af97ab21d6bf93eda96b68e098f86cd6cb5e55c405cc71111181:3781eb9c417a1e399bce8a9f42b8c5557d40f817d49d6ae2694b67c43dbd7b7c
-    - agent-libos-agentvfs:v0:4eaac4a2f3f042778c4a5723e067152c24f64c1498fb58a5e1ab1a979d9fad86:8b3bc62a5b1f1021135064c85eded9eb4b24f8101da833045f72f82f852693de
+    - agent-libos-agentvfs:v0:4b29d1f177c990d0cf46d6af0b261061a1549e6a3789fb5443c56f1c7d3afc92:15598fd8dcddc72e87cc01cfbba62283f42f886be2169144e3600cb776053ed7
 
 data_flow:
   default_trust_level: untrusted
