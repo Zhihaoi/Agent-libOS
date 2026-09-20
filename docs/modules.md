@@ -629,6 +629,12 @@ reserved use; a failure after a send attempt keeps it consumed because the
 daemon may already have changed state. Filesystem mutations remain external
 effects: ordinary libOS checkpoint restore does not undo them automatically.
 
+Every command also checks the current data labels against the Host-configured
+data-flow Sink `agentvfs:<workspace>` before socket traffic. Ordinary data is
+accepted by the default Sink policy; sensitive or tenant-scoped data requires
+appropriate Host Sink clearance (and an exact release for conditional Sinks).
+Replies are treated as untrusted ingress and retain the request's sensitivity.
+
 Both mutating tools accept `pair_libos` to couple the two state planes. A
 paired checkpoint additionally creates a libOS checkpoint (requiring the
 process's `checkpoint:process:<pid>` write right, probed before any socket
@@ -644,8 +650,11 @@ an in-quantum restore is refused by design; the tool then reports
 `libos_restore=pending_host_restore` with a Host hint (audited as
 `module.agentvfs.libos_restore_pending`), and the Host completes
 `CheckpointManager.restore` once the process is quiescent. With Host-granted
-checkpoint admin and an idle scheduler, both planes restore inside the one
-tool call. Restore warnings and pending reconciliation remain visible in the
+checkpoint admin, any required image authority, and an idle scheduler, both
+planes restore inside the one tool call. If image authority is missing after
+filesystem rollback, the result preserves the completed filesystem commit and
+reports `pending_host_restore`; the Host finishes only the libOS restore.
+Restore warnings and pending reconciliation remain visible in the
 result instead of being reported as full success. Pairing records an association,
 not an atomic transaction across both systems: the Host must coordinate workspace
 writers and finish any pending restore before resuming work.

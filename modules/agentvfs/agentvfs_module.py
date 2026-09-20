@@ -39,6 +39,8 @@ from agent_libos.models import (
     AgentImage,
     CapabilityDecision,
     CapabilityRight,
+    DataFlowDirection,
+    DataSink,
     EventType,
     ExternalEffectClassification,
     ExternalEffectRollbackClass,
@@ -231,6 +233,7 @@ class AgentVfsAdapter:
                     resource_policy=ResourcePolicy.NONE,
                     state_mutation=operation != "status",
                     information_flow=True,
+                    data_flow_direction=DataFlowDirection.BIDIRECTIONAL,
                 )
             )
 
@@ -278,6 +281,8 @@ class AgentVfsAdapter:
         canonical_args = dict(context)
         if argument is not None:
             canonical_args["argument"] = argument
+        line = operation if argument is None else f"{operation} {argument}"
+        flow_context = self.host.data_flow.current_context()
         invocation = ProtectedOperationInvocation(
             pid=pid,
             actor=pid,
@@ -285,9 +290,15 @@ class AgentVfsAdapter:
             decisions=(decision,),
             canonical_args=canonical_args,
             observation=context,
+            data_sink=DataSink(self.resource),
+            data_flow_context=flow_context,
+            data_flow_ingress_context=self.host.data_flow.unclassified_ingress_context(
+                flow_context, origin="external:agentvfs"
+            ),
+            data_flow_payload=line,
+            data_flow_operation=f"module.agentvfs.{operation}",
         )
         mutates = operation != "status"
-        line = operation if argument is None else f"{operation} {argument}"
         with self.host.protected_operations.start(
             f"module.agentvfs.{operation}", invocation, provider=self
         ) as protected:
@@ -508,6 +519,17 @@ def _restore_libos_paired(
         )
     try:
         result = runtime.checkpoint.restore(pid, checkpoint_id)
+    except CapabilityDenied:
+        # Restore also checks authority for images it must replace. Those
+        # pre-commit refusals leave libOS unchanged, but the filesystem has
+        # already rolled back and its completed outcome must remain visible.
+        hint = (
+            f"{_HOST_RESTORE_HINT}; libOS restore requires additional authority. "
+            "The filesystem rollback has completed. Do not repeat it."
+        )
+        return _pending_restore(
+            runtime, pid, workspace, checkpoint_id, "restore_authority", hint
+        )
     except ValidationError as exc:
         if _RESTORE_REFUSED_PREFIX in str(exc):
             hint = f"{_HOST_RESTORE_HINT}; scheduler refused the in-tool restore: {exc}"
@@ -593,7 +615,7 @@ class AgentvfsRollbackArgs(BaseModel):
             "Validate the named paired libOS checkpoint, workspace, and target before "
             "rolling back to its immutable filesystem commit, then attempt its libOS "
             "restore. The libOS restore is Host-mediated when the process "
-            "lacks checkpoint admin authority or the scheduler is running; the result "
+            "lacks required checkpoint or image authority or the scheduler is running; the result "
             "then reports libos_restore=pending_host_restore with a hint instead of "
             "restoring in-tool."
         ),
@@ -702,7 +724,7 @@ class AgentvfsRollbackTool(SyncAgentTool[AgentvfsRollbackArgs]):
         "pair_libos=true it validates the checkpoint workspace and target before "
         "restoring the paired immutable filesystem commit and libOS object/SQL state. "
         "When the in-tool libOS "
-        "restore is not permitted (missing checkpoint admin authority) or is "
+        "restore is not permitted (missing checkpoint or image authority) or is "
         "refused while the scheduler runs, the filesystem rollback still stands "
         "and the result reports libos_restore=pending_host_restore so the Host "
         "can finish the second plane once the process is quiescent."

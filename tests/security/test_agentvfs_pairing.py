@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
+from dataclasses import replace
 import socket
 from typing import Any
 
 import pytest
 
-from agent_libos import Runtime
+from agent_libos import ObjectMetadata, ObjectType, Runtime
+from agent_libos.models import ObjectPatch
 from agent_libos.tools.base import ToolContext
 from modules.agentvfs.agentvfs_module import AgentvfsRollbackArgs, AgentvfsRollbackTool
 
@@ -179,6 +181,76 @@ def test_paired_rollback_rejects_unexpected_daemon_commit_before_libos_restore(
     )
     assert restore_calls == []
     assert agentvfs._fake.received == ["checkpoint c1", f"rollback {COMMIT_B}"]
+
+
+def test_paired_rollback_preserves_partial_outcome_when_image_authority_is_missing(
+    agentvfs: _ModuleHarness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime = agentvfs._open_runtime(monkeypatch)
+    pid = agentvfs._spawn(runtime, ["read", "write", "admin"])
+    note = runtime.memory.create_object(
+        pid,
+        ObjectType.PLAN,
+        {"version": 1},
+        ObjectMetadata(title="paired note"),
+        immutable=False,
+        name="agentvfs.paired.note",
+    )
+    original_image = runtime.get_image("agentvfs-agent:v0")
+    created = runtime.tools.call(
+        pid, "agentvfs_checkpoint", {"label": "c1", "pair_libos": True}
+    )
+    assert created.ok, created.error
+    checkpoint_id = created.payload["libos_checkpoint_id"]
+    runtime.capability.grant(
+        subject=pid,
+        resource=f"checkpoint:{checkpoint_id}",
+        rights=["admin"],
+        issued_by="test",
+    )
+    runtime.memory.update_object(pid, note, ObjectPatch(payload={"version": 2}))
+    changed_image = replace(original_image, name="changed image")
+    runtime.register_image(changed_image, replace=True)
+
+    result = runtime.tools.call(
+        pid,
+        "agentvfs_rollback",
+        {"target": "c1", "pair_libos": True, "libos_checkpoint_id": checkpoint_id},
+    )
+
+    assert result.ok, result.error
+    assert result.payload["rolled_back_to"] == COMMIT_B
+    assert result.payload["paired_libos_checkpoint_id"] == checkpoint_id
+    assert result.payload["libos_restore"] == "pending_host_restore"
+    hint = result.payload["libos_restore_hint"]
+    assert "additional authority" in hint
+    assert "Do not repeat" in hint
+    assert "image:agentvfs-agent:v0" not in hint
+    assert runtime.get_image(original_image.image_id).name == changed_image.name
+    assert runtime.memory.get_object_by_name(
+        pid, "agentvfs.paired.note"
+    ).payload == {"version": 2}
+    pending = [
+        record
+        for record in runtime.audit.trace()
+        if record.action == "module.agentvfs.libos_restore_pending"
+    ]
+    assert len(pending) == 1
+    assert pending[0].target == f"checkpoint:{checkpoint_id}"
+    assert pending[0].decision["reason"] == "restore_authority"
+    expected_requests = ["checkpoint c1", f"rollback {COMMIT_B}"]
+    assert agentvfs._fake.received == expected_requests
+
+    restored = runtime.checkpoint.restore(
+        "test", checkpoint_id, require_capability=False
+    )
+
+    assert restored["status"] == "restored"
+    assert runtime.get_image(original_image.image_id).name == original_image.name
+    assert runtime.memory.get_object_by_name(
+        pid, "agentvfs.paired.note"
+    ).payload == {"version": 1}
+    assert agentvfs._fake.received == expected_requests
 
 
 def test_paired_rollback_preserves_committed_restore_recovery_outcome(
