@@ -2096,24 +2096,44 @@ def test_release_workflow_preserves_and_clean_installs_validated_artifacts() -> 
             "include": [
                 {"name": "unit", "lane": "unit", "shard_args": ""},
                 {
-                    "name": "runtime 1/4",
+                    "name": "runtime 1/8",
                     "lane": "runtime",
-                    "shard_args": "--shard-count 4 --shard-index 0",
+                    "shard_args": "--shard-count 8 --shard-index 0",
                 },
                 {
-                    "name": "runtime 2/4",
+                    "name": "runtime 2/8",
                     "lane": "runtime",
-                    "shard_args": "--shard-count 4 --shard-index 1",
+                    "shard_args": "--shard-count 8 --shard-index 1",
                 },
                 {
-                    "name": "runtime 3/4",
+                    "name": "runtime 3/8",
                     "lane": "runtime",
-                    "shard_args": "--shard-count 4 --shard-index 2",
+                    "shard_args": "--shard-count 8 --shard-index 2",
                 },
                 {
-                    "name": "runtime 4/4",
+                    "name": "runtime 4/8",
                     "lane": "runtime",
-                    "shard_args": "--shard-count 4 --shard-index 3",
+                    "shard_args": "--shard-count 8 --shard-index 3",
+                },
+                {
+                    "name": "runtime 5/8",
+                    "lane": "runtime",
+                    "shard_args": "--shard-count 8 --shard-index 4",
+                },
+                {
+                    "name": "runtime 6/8",
+                    "lane": "runtime",
+                    "shard_args": "--shard-count 8 --shard-index 5",
+                },
+                {
+                    "name": "runtime 7/8",
+                    "lane": "runtime",
+                    "shard_args": "--shard-count 8 --shard-index 6",
+                },
+                {
+                    "name": "runtime 8/8",
+                    "lane": "runtime",
+                    "shard_args": "--shard-count 8 --shard-index 7",
                 },
                 {"name": "security", "lane": "security", "shard_args": ""},
                 {
@@ -2137,14 +2157,24 @@ def test_release_workflow_preserves_and_clean_installs_validated_artifacts() -> 
                     "shard_args": "--shard-count 3 --shard-index 2",
                 },
                 {
-                    "name": "benchmark 1/2",
+                    "name": "benchmark 1/4",
                     "lane": "benchmark",
-                    "shard_args": "--shard-count 2 --shard-index 0",
+                    "shard_args": "--shard-count 4 --shard-index 0",
                 },
                 {
-                    "name": "benchmark 2/2",
+                    "name": "benchmark 2/4",
                     "lane": "benchmark",
-                    "shard_args": "--shard-count 2 --shard-index 1",
+                    "shard_args": "--shard-count 4 --shard-index 1",
+                },
+                {
+                    "name": "benchmark 3/4",
+                    "lane": "benchmark",
+                    "shard_args": "--shard-count 4 --shard-index 2",
+                },
+                {
+                    "name": "benchmark 4/4",
+                    "lane": "benchmark",
+                    "shard_args": "--shard-count 4 --shard-index 3",
                 },
             ]
         },
@@ -2166,7 +2196,7 @@ def test_release_workflow_preserves_and_clean_installs_validated_artifacts() -> 
         for item in windows_job["steps"]
         if item.get("name") == "Run deterministic Python lane"
     )
-    assert windows_tests["env"]["PYTEST_ADDOPTS"] == "--timeout=300"
+    assert windows_tests["env"]["PYTEST_ADDOPTS"] == "--timeout=300 --maxfail=1"
     host_identity_job = parsed["jobs"]["host-filesystem-identity"]
     assert host_identity_job["runs-on"] == "${{ matrix.runner }}"
     assert host_identity_job["needs"] == "static"
