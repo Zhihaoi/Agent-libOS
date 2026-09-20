@@ -283,3 +283,164 @@ def test_prompt_cache_cost_does_not_treat_unknown_write_tokens_as_zero() -> None
                 output_per_million=30.0,
             ),
         )
+
+
+def _leak_categories(*, host_projection: int, terminal: int) -> dict[str, int]:
+    return {
+        "host_contract_fields": 0,
+        "materialization_fields": 0,
+        "completion_binding_fields": host_projection,
+        "current_process_ids": 0,
+        "terminal_host_identifiers": terminal,
+    }
+
+
+def _same_layout_canary_arms(
+    *,
+    legacy_host_projection: int = 3,
+    candidate_host_projection: int = 3,
+    candidate_terminal: int = 0,
+) -> tuple[dict[str, object], dict[str, object]]:
+    legacy = _legacy_report()
+    legacy["prompt_layout"] = "legacy_v1"
+    legacy_metrics = legacy["metrics"]
+    assert isinstance(legacy_metrics, dict)
+    legacy_metrics["forbidden_internal_id_leaks"] = legacy_host_projection
+    legacy_metrics["forbidden_internal_id_leaks_by_category"] = _leak_categories(
+        host_projection=legacy_host_projection, terminal=0
+    )
+    candidate = _candidate_report()
+    candidate.pop("release_gates")
+    candidate["pricing_known"] = False
+    candidate.pop("cost")
+    candidate["prompt_layout"] = "legacy_v1"
+    candidate_metrics = candidate["metrics"]
+    assert isinstance(candidate_metrics, dict)
+    candidate_metrics["forbidden_internal_id_leaks"] = (
+        candidate_host_projection + candidate_terminal
+    )
+    candidate_metrics["forbidden_internal_id_leaks_by_category"] = _leak_categories(
+        host_projection=candidate_host_projection, terminal=candidate_terminal
+    )
+    return legacy, candidate
+
+
+def test_prompt_cache_gate_reports_leak_breakdown_metrics() -> None:
+    candidate = _candidate_report()
+    metrics = candidate["metrics"]
+    assert isinstance(metrics, dict)
+    metrics["forbidden_internal_id_leaks_by_category"] = _leak_categories(
+        host_projection=0, terminal=0
+    )
+
+    result = evaluate_prompt_cache_release_gate(_legacy_report(), candidate)
+
+    assert result["passed"] is True
+    assert result["metrics"]["legacy_forbidden_internal_id_leaks"] is None
+    assert result["metrics"]["legacy_forbidden_internal_id_leaks_by_category"] is None
+    assert result["metrics"]["candidate_forbidden_internal_id_leaks"] == 0
+    assert result["metrics"][
+        "candidate_forbidden_internal_id_leaks_by_category"
+    ] == _leak_categories(host_projection=0, terminal=0)
+
+
+def test_same_layout_canary_inherits_host_projection_but_not_model_identifiers() -> None:
+    """Two legacy_v1 arms share the layout's review projection; only the change is judged."""
+
+    legacy, candidate = _same_layout_canary_arms()
+
+    result = evaluate_prompt_cache_release_gate(
+        legacy,
+        candidate,
+        strict_release_evidence=False,
+    )
+
+    assert result["passed"] is True
+    assert result["checks"]["forbidden_internal_id_leaks"] is True
+    assert result["metrics"]["legacy_forbidden_internal_id_leaks"] == 3
+    assert result["metrics"]["candidate_forbidden_internal_id_leaks"] == 3
+
+
+@pytest.mark.parametrize(
+    ("candidate_host_projection", "candidate_terminal"),
+    [(4, 0), (3, 1), (0, 1)],
+)
+def test_same_layout_canary_rejects_leak_regressions(
+    candidate_host_projection: int,
+    candidate_terminal: int,
+) -> None:
+    legacy, candidate = _same_layout_canary_arms(
+        candidate_host_projection=candidate_host_projection,
+        candidate_terminal=candidate_terminal,
+    )
+
+    result = evaluate_prompt_cache_release_gate(
+        legacy,
+        candidate,
+        strict_release_evidence=False,
+    )
+
+    assert result["passed"] is False
+    assert result["checks"]["forbidden_internal_id_leaks"] is False
+
+
+def test_strict_gate_requires_zero_identifiers_even_for_same_layout_arms() -> None:
+    legacy, candidate = _same_layout_canary_arms()
+    candidate["release_gates"] = _candidate_report()["release_gates"]
+
+    result = evaluate_prompt_cache_release_gate(legacy, candidate)
+
+    assert result["passed"] is False
+    assert result["checks"]["forbidden_internal_id_leaks"] is False
+
+
+def test_canary_across_layouts_requires_zero_identifiers() -> None:
+    legacy, candidate = _same_layout_canary_arms()
+    candidate["prompt_layout"] = "cache_optimized_v2"
+
+    result = evaluate_prompt_cache_release_gate(
+        legacy,
+        candidate,
+        strict_release_evidence=False,
+    )
+
+    assert result["checks"]["forbidden_internal_id_leaks"] is False
+
+
+def test_canary_without_legacy_leak_measurement_requires_zero_identifiers() -> None:
+    legacy, candidate = _same_layout_canary_arms()
+    legacy_metrics = legacy["metrics"]
+    assert isinstance(legacy_metrics, dict)
+    legacy_metrics.pop("forbidden_internal_id_leaks")
+    legacy_metrics.pop("forbidden_internal_id_leaks_by_category")
+
+    result = evaluate_prompt_cache_release_gate(
+        legacy,
+        candidate,
+        strict_release_evidence=False,
+    )
+
+    assert result["checks"]["forbidden_internal_id_leaks"] is False
+    assert result["metrics"]["legacy_forbidden_internal_id_leaks"] is None
+
+
+def test_prompt_cache_gate_rejects_unreconciled_leak_categories() -> None:
+    candidate = _candidate_report()
+    metrics = candidate["metrics"]
+    assert isinstance(metrics, dict)
+    metrics["forbidden_internal_id_leaks_by_category"] = _leak_categories(
+        host_projection=1, terminal=0
+    )
+
+    with pytest.raises(ValueError, match="reconcile"):
+        evaluate_prompt_cache_release_gate(_legacy_report(), candidate)
+
+
+def test_prompt_cache_gate_rejects_fractional_leak_counts() -> None:
+    candidate = _candidate_report()
+    metrics = candidate["metrics"]
+    assert isinstance(metrics, dict)
+    metrics["forbidden_internal_id_leaks"] = 0.5
+
+    with pytest.raises(ValueError, match="non-negative integer"):
+        evaluate_prompt_cache_release_gate(_legacy_report(), candidate)

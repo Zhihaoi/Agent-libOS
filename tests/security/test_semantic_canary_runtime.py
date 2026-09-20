@@ -7,6 +7,7 @@ import subprocess
 import time
 from copy import deepcopy
 from dataclasses import replace
+from datetime import datetime, timedelta
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
@@ -39,6 +40,7 @@ from agent_libos.models import (
     HumanRequestStatus,
     ObjectMetadata,
     ObjectType,
+    SemanticAssessmentRequest,
     SemanticApprovalRule,
     SemanticPolicyEpochV1,
     SinkTrustLevel,
@@ -64,7 +66,7 @@ _TENANT = "tenant-canary-security"
 _PROFILE_ID = "semantic-canary-security"
 _MODEL = "semantic-canary-model"
 _RULE_ID = "canary-reports-read"
-_REAL_GIT_ASSESSMENT_TIMEOUT_S = 180.0
+_CANARY_ASSESSMENT_TIMEOUT_S = 180.0
 
 
 class _SuccessfulSemanticClient:
@@ -177,6 +179,10 @@ def _canary_config(
             external_profile_id=_PROFILE_ID,
             policy_epoch=epoch,
             max_concurrency=1,
+            # Authority transition tests need setup assessments to finish even
+            # when filesystem/Git capture is slow on loaded Windows workers.
+            assessment_timeout_s=_CANARY_ASSESSMENT_TIMEOUT_S,
+            job_lease_s=_CANARY_ASSESSMENT_TIMEOUT_S,
         ),
         data_flow=DataFlowDefaults(
             sink_rules=(
@@ -380,21 +386,6 @@ def _git_rule(action_id: str) -> SemanticApprovalRule:
         authority_operation=action_id,
         resource="git:workspace",
         rights=(right,),
-    )
-
-
-def _real_git_canary_config(rule: SemanticApprovalRule) -> AgentLibOSConfig:
-    config = _canary_config(auto_approval_rules=(rule,))
-    # Live Git snapshots can exceed the production 30-second assessment window
-    # under loaded Windows xdist workers. These tests exercise exact Git
-    # binding and drift fences, not the deadline fallback.
-    return replace(
-        config,
-        semantic=replace(
-            config.semantic,
-            assessment_timeout_s=_REAL_GIT_ASSESSMENT_TIMEOUT_S,
-            job_lease_s=_REAL_GIT_ASSESSMENT_TIMEOUT_S,
-        ),
     )
 
 
@@ -654,7 +645,9 @@ def _issue_exact_canary_capability(
     pending = runtime.human.get(request_id)
     context = dict(pending.payload["context"])
     _drain_semantic(runtime)
-    assert runtime.human.get(request_id).status is HumanRequestStatus.APPROVED
+    assert runtime.human.get(request_id).status is HumanRequestStatus.APPROVED, (
+        runtime.semantic.status()
+    )
     settlements = runtime.uow.semantic.query_semantic_machine_settlements(
         after=None,
         limit=20,
@@ -824,7 +817,7 @@ def test_real_git_canary_exact_request_issues_consumes_and_succeeds(
     client = _SuccessfulSemanticClient()
     runtime = Runtime.open(
         tmp_path / f"{action_id}.sqlite",
-        config=_real_git_canary_config(rule),
+        config=_canary_config(auto_approval_rules=(rule,)),
         substrate=LocalResourceProviderSubstrate(workspace),
         semantic_tenant_bucketer=_tenant_bucket,
     )
@@ -964,7 +957,7 @@ def test_real_git_canary_drift_blocks_before_protected_provider_dispatch(
     rule = _git_rule("git.read")
     runtime = Runtime.open(
         tmp_path / f"git-drift-{drift}.sqlite",
-        config=_real_git_canary_config(rule),
+        config=_canary_config(auto_approval_rules=(rule,)),
         substrate=LocalResourceProviderSubstrate(workspace),
         semantic_tenant_bucketer=_tenant_bucket,
     )
@@ -2395,6 +2388,7 @@ def test_real_capability_manager_structural_violation_trip_matrix(
 def test_off_stale_or_expired_grant_denies_without_safety_trip(
     denial: str,
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Expected revocation/staleness is denial, not an unsafe-canary signal."""
 
@@ -2410,6 +2404,20 @@ def test_off_stale_or_expired_grant_denies_without_safety_trip(
         semantic_tenant_bucketer=_tenant_bucket,
     )
     try:
+        original_request_model = runtime.semantic._request_model
+
+        def aged_request_model(**kwargs: Any) -> SemanticAssessmentRequest:
+            request = original_request_model(**kwargs)
+            # Simulate 31 seconds spent waiting for assessment without sleeping.
+            return replace(
+                request,
+                deadline_at=(
+                    datetime.fromisoformat(request.deadline_at)
+                    - timedelta(seconds=31)
+                ).isoformat(),
+            )
+
+        monkeypatch.setattr(runtime.semantic, "_request_model", aged_request_model)
         _pid, _resource, _flow, capability, context = (
             _issue_exact_canary_capability(
                 runtime,

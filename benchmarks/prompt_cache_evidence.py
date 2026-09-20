@@ -41,6 +41,41 @@ TERMINAL_HOST_IDENTIFIER_PATTERN = re.compile(
     rf"\b(?:(?:pid|obj|cap|ckpt|pmsg|evt|run|trreq|trp|ctxmat|view)_"
     rf"{_HOST_ID_SUFFIX}|tool_static_[0-9a-f]{{12,64}})\b"
 )
+TERMINAL_MODEL_TOOLS = frozenset({"human_output", "process_exit"})
+
+# ``process_exit`` fields whose values the Runtime *requires* to be Host
+# identifiers.  ``result_oid`` names an existing Object by contract, and under
+# cumulative exit review the legacy completion contract makes the Model copy the
+# reviewed goal Object id, the acknowledged Human message ids, and each
+# requirement's ``source_refs`` back verbatim (anything else is rejected as a
+# completion-identity error).  Copying an identifier into the field that exists
+# to carry it is the contract, not a leak, so every scan of ``process_exit``
+# arguments drops exactly these positions.  All other ``process_exit`` fields
+# (``message``, ``payload``, ``requirement``, ``evidence_summary``,
+# ``final_verification``, ...) and every ``human_output`` field are free text
+# that the contract forbids Host identifiers in, so they are scanned in full.
+# List indices are normalised to ``"*"``.
+PROCESS_EXIT_CONTRACT_IDENTIFIER_PATHS: frozenset[tuple[str, ...]] = frozenset(
+    {
+        ("result_oid",),
+        ("completion_evidence", "goal_oid"),
+        ("completion_evidence", "reviewed_message_ids"),
+        ("completion_evidence", "acceptance_checks", "*", "source_refs"),
+    }
+)
+# Positions where ``ProcessExitArgs`` decodes JSON-encoded strings before
+# validation.  The scan decodes the same positions so a string-encoded
+# ``completion_evidence`` binds to the same contract fields the Runtime binds.
+_PROCESS_EXIT_JSON_STRING_PATHS: frozenset[tuple[str, ...]] = frozenset(
+    {
+        ("completion_evidence",),
+        ("completion_evidence", "reviewed_message_ids"),
+        ("completion_evidence", "acceptance_checks"),
+        ("completion_evidence", "final_verification"),
+        ("completion_evidence", "acceptance_checks", "*", "source_refs"),
+        ("completion_evidence", "acceptance_checks", "*", "evidence_tool_calls"),
+    }
+)
 
 
 def collect_prompt_cache_call_evidence(calls: Iterable[Any]) -> dict[str, Any]:
@@ -250,11 +285,11 @@ def forbidden_model_text_leak_details(
                 categories[category] += hits
                 surfaces[surface] += hits
         terminal_hits = sum(
-            len(TERMINAL_HOST_IDENTIFIER_PATTERN.findall(arguments))
-            for name, arguments in _model_tool_call_arguments(
+            len(TERMINAL_HOST_IDENTIFIER_PATTERN.findall(scan_text))
+            for name, scan_text in _model_tool_call_arguments(
                 _record_value(call, "tool_calls")
             )
-            if name in {"human_output", "process_exit"}
+            if name in TERMINAL_MODEL_TOOLS
         )
         categories["terminal_host_identifiers"] += terminal_hits
         surfaces["tool_calls"] += terminal_hits
@@ -378,6 +413,13 @@ def _model_visible_text(value: Any) -> str:
 
 
 def _model_tool_call_arguments(value: Any) -> list[tuple[str, str]]:
+    """Return ``(tool_name, scan_text)`` pairs for Model tool calls.
+
+    ``process_exit`` arguments are returned with the contract-required
+    identifier fields removed (see :func:`process_exit_scan_text`); every other
+    tool's arguments are returned verbatim.
+    """
+
     rows = value if isinstance(value, list) else [value]
     selected: list[tuple[str, str]] = []
     for row in rows:
@@ -391,8 +433,55 @@ def _model_tool_call_arguments(value: Any) -> list[tuple[str, str]]:
             continue
         if not isinstance(arguments, str):
             arguments = _model_visible_text(arguments)
+        if name == "process_exit":
+            arguments = process_exit_scan_text(arguments)
         selected.append((name, arguments))
     return selected
+
+
+def process_exit_scan_text(arguments: str) -> str:
+    """Return ``process_exit`` arguments without contract-required identifiers.
+
+    The arguments are parsed as JSON, JSON-encoded strings are decoded at the
+    positions where the Runtime decodes them, and the fields listed in
+    :data:`PROCESS_EXIT_CONTRACT_IDENTIFIER_PATHS` are removed before the text
+    is re-serialised for scanning.  Arguments that are not a JSON object are
+    returned unchanged, so an unparseable call is scanned in full (fail
+    closed) rather than trusted.
+    """
+
+    decoded = _decode_json(arguments)
+    if not isinstance(decoded, Mapping):
+        return arguments
+    return _model_visible_text(_without_contract_identifier_fields(decoded, ()))
+
+
+def _without_contract_identifier_fields(value: Any, path: tuple[str, ...]) -> Any:
+    if isinstance(value, str) and path in _PROCESS_EXIT_JSON_STRING_PATHS:
+        decoded = _decode_json(value)
+        if isinstance(decoded, (Mapping, list)):
+            value = decoded
+    if isinstance(value, Mapping):
+        retained: dict[str, Any] = {}
+        for key, item in value.items():
+            key_text = key if isinstance(key, str) else str(key)
+            item_path = (*path, key_text)
+            if item_path in PROCESS_EXIT_CONTRACT_IDENTIFIER_PATHS:
+                continue
+            retained[key_text] = _without_contract_identifier_fields(item, item_path)
+        return retained
+    if isinstance(value, list):
+        return [
+            _without_contract_identifier_fields(item, (*path, "*")) for item in value
+        ]
+    return value
+
+
+def _decode_json(text: str) -> Any:
+    try:
+        return json.loads(text)
+    except (TypeError, ValueError):
+        return None
 
 
 def _record_value(record: Any, key: str) -> Any:
@@ -435,10 +524,13 @@ def _required_nonnegative_int(value: Any, field: str) -> int:
 __all__ = [
     "FORBIDDEN_MODEL_TEXT_CATEGORIES",
     "FORBIDDEN_MODEL_TEXT_PATTERNS",
+    "PROCESS_EXIT_CONTRACT_IDENTIFIER_PATHS",
     "TERMINAL_HOST_IDENTIFIER_PATTERN",
+    "TERMINAL_MODEL_TOOLS",
     "aggregate_model_text_leak_details",
     "aggregate_prompt_cache_run_evidence",
     "collect_prompt_cache_call_evidence",
     "forbidden_model_text_leak_details",
+    "process_exit_scan_text",
     "validate_prompt_cache_leak_evidence",
 ]

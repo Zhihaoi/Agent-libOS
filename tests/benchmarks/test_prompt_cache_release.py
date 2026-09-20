@@ -454,6 +454,15 @@ def test_built_multi_provider_arms_pass_the_strict_paired_gate() -> None:
 
     assert result["passed"] is True
     assert all(result["checks"].values())
+    assert result["metrics"]["legacy_forbidden_internal_id_leaks"] == 0
+    assert result["metrics"]["candidate_forbidden_internal_id_leaks"] == 0
+    assert result["metrics"]["candidate_forbidden_internal_id_leaks_by_category"] == {
+        "host_contract_fields": 0,
+        "materialization_fields": 0,
+        "completion_binding_fields": 0,
+        "current_process_ids": 0,
+        "terminal_host_identifiers": 0,
+    }
 
 
 def _arm(

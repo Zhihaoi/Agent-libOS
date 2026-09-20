@@ -291,9 +291,9 @@ set_working_directory|path|working_directory|100
 spawn_child_process|goal|child_pid,parent_pid,image,status,goal_oid,inherited_capabilities,fresh_memory_view,working_directory,resource_budget,selected_parent_root_oids,memory_root_oids|100
 start_object_task|tool|task|100
 validate_jit_tool|candidate_id|ok,errors,warnings,logs|100
-write_object_to_file|name,path|oid,namespace,name,path,bytes_written,created|100
+write_object_to_file|name,path|oid,namespace,name,path,bytes_written,created,content_sha256|100
 write_directory|path|path,created|101
-write_text_file|path,content|path,bytes_written,created|101
+write_text_file|path,content|path,bytes_written,created,content_sha256,content,encoding|101
 ask_human|question|request_id,answer,status|100
 human_output|message|delivered,channel,chars|100
 call_jsonrpc_method|endpoint_id,method_id|endpoint_id,method_id,rpc_method,request_id,status,http_status,ok,response_bytes,duration_s|100
@@ -394,9 +394,9 @@ set_working_directory|working_directory
 spawn_child_process|child_pid,fresh_memory_view,goal_oid,image,inherited_capabilities,memory_root_oids,parent_pid,resource_budget,selected_parent_root_oids,status,working_directory
 start_object_task|task
 validate_jit_tool|errors,logs,ok,warnings
-write_object_to_file|bytes_written,created,name,namespace,oid,path
+write_object_to_file|bytes_written,content_sha256,created,name,namespace,oid,path
 write_directory|created,path
-write_text_file|bytes_written,created,path
+write_text_file|bytes_written,content,content_sha256,created,encoding,path
 ask_human|answer,request_id,status
 human_output|channel,chars,delivered
 call_jsonrpc_method|duration_s,endpoint_id,error,http_status,method_id,ok,request_id,response_bytes,result,rpc_method,status
@@ -1185,9 +1185,13 @@ def test_builtin_images_start_with_only_the_source_neutral_skill_lifecycle(
             "process_exit",
             "read_skill_resource",
             "unload_skill",
+            # Mandatory input handling is projected without discovery for
+            # images that own the message-read tools.
+            "read_process_messages",
+            "receive_process_messages",
         }
         assert process.loaded_skills == {}
-        assert len(runtime.tools.openai_tool_schemas(pid)) == 5
+        assert len(runtime.tools.openai_tool_schemas(pid)) == 7
         assert len(process.tool_table) > len(process.model_tool_table)
     finally:
         runtime.close()

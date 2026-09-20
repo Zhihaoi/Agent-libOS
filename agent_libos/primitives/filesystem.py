@@ -21,6 +21,7 @@ from agent_libos.models import (
     CapabilityEffect,
     CapabilityRight,
     DataFlowContext,
+    DataLabels,
     DataSink,
     EventType,
     ExternalEffectClassification,
@@ -75,6 +76,7 @@ class FileWriteResult:
     path: str
     bytes_written: int
     created: bool
+    content_sha256: str | None = None
 
 
 @dataclass(frozen=True)
@@ -126,6 +128,7 @@ class _TextWritePlan:
     decision: CapabilityDecision
     authority_context: dict[str, Any]
     bytes_to_write: int
+    content_sha256: str
     effect_context: dict[str, Any]
 
 
@@ -214,24 +217,29 @@ class FilesystemAdapter:
             "resource": resource,
             "expected_kind": "directory",
         }
-        usage = ResourceUsage(external_read_bytes=_DIRECTORY_STATE_OBSERVATION_BYTES)
-        invocation = ProtectedOperationInvocation(
-            pid=pid,
-            actor=pid,
-            target=resource,
-            decisions=(decision,),
-            canonical_args=authority_context,
-            observation=effect_context,
-            preflight_usage=usage,
-            resource_source="primitive.filesystem.validate_directory",
-            resource_context=effect_context,
-            failure_evidence=lambda error, phase: self._protected_failure_evidence(
-                pid, resource, "primitive.filesystem.validate_directory.failed", effect_context, error, phase
-            ),
-        )
-        with self._protected().start(
-            "primitive.filesystem.validate_directory", invocation, provider=self.provider
-        ) as protected:
+        with ExitStack() as stack:
+            # A later delete can tombstone the binding; retain the labels that
+            # governed this state observation through event settlement.
+            stack.enter_context(self._file_label_io_lock.hold(relative))
+            read_context = self._data_flow().file_context(relative)
+            usage = ResourceUsage(external_read_bytes=_DIRECTORY_STATE_OBSERVATION_BYTES)
+            invocation = ProtectedOperationInvocation(
+                pid=pid,
+                actor=pid,
+                target=resource,
+                decisions=(decision,),
+                canonical_args=authority_context,
+                observation=effect_context,
+                preflight_usage=usage,
+                resource_source="primitive.filesystem.validate_directory",
+                resource_context=effect_context,
+                failure_evidence=lambda error, phase: self._protected_failure_evidence(
+                    pid, resource, "primitive.filesystem.validate_directory.failed", effect_context, error, phase
+                ),
+            )
+            protected = stack.enter_context(self._protected().start(
+                "primitive.filesystem.validate_directory", invocation, provider=self.provider
+            ))
             state = protected.call(
                 ProviderPhase("state", information_flow=True), self.provider.state, target
             )
@@ -252,7 +260,10 @@ class FilesystemAdapter:
                     resource,
                     EventType.EXTERNAL_READ,
                     "primitive.filesystem.validate_directory",
-                    {"adapter": "filesystem", "operation": "state", "path": relative, **result_payload},
+                    {
+                        "adapter": "filesystem", "operation": "state", "path": relative,
+                        "data_labels": read_context.labels.to_dict(), **result_payload,
+                    },
                     {"path": relative, "state_kind": state.kind, **result_payload},
                     result_payload,
                 ),
@@ -621,7 +632,9 @@ class FilesystemAdapter:
             source_oids=source_oids,
             expected_content_sha256=expected_content_sha256,
         )
-        bytes_to_write = len(text.encode(encoding))
+        encoded_content = text.encode(encoding)
+        bytes_to_write = len(encoded_content)
+        content_sha256 = hashlib.sha256(encoded_content).hexdigest()
         effect_context = {
             "path": relative,
             "resource": resource,
@@ -647,6 +660,7 @@ class FilesystemAdapter:
             decision=decision,
             authority_context=authority_context,
             bytes_to_write=bytes_to_write,
+            content_sha256=content_sha256,
             effect_context=effect_context,
         )
 
@@ -798,10 +812,12 @@ class FilesystemAdapter:
                 path=plan.relative,
                 bytes_written=plan.bytes_to_write,
                 created=created,
+                content_sha256=plan.content_sha256,
             )
             result_payload = {
                 "bytes_written": plan.bytes_to_write,
                 "created": created,
+                "content_sha256": plan.content_sha256,
             }
             completed = protected.complete(
                 result,
@@ -1022,6 +1038,7 @@ class FilesystemAdapter:
                 path=relative, entries=entries, count=len(entries), truncated=truncated
             )
             result_payload = {"count": len(entries), "truncated": truncated}
+            self._data_flow().observe_ingress(directory_context)
             completed = protected.complete(
                 result,
                 self._protected_filesystem_evidence(
@@ -1041,7 +1058,6 @@ class FilesystemAdapter:
                     context={**effect_context, "metadata_bytes": metadata_bytes, "listed_entries": len(children)},
                 ),
             )
-            self._data_flow().observe_ingress(directory_context)
             return completed
 
     def write_directory(
@@ -1870,6 +1886,17 @@ class FilesystemAdapter:
         intent_record: Any | None = None,
     ) -> ProtectedOperationEvidence:
         parent_id = getattr(intent_record, "record_id", None)
+        path = event_payload.get("path")
+        if isinstance(path, str):
+            # Snapshot the existing target labels before write/delete settlement
+            # changes its binding. The SDK also merges invocation/source labels.
+            labels = self._data_flow().file_context(path).labels
+            if "data_labels" in event_payload:
+                labels = DataLabels.aggregate((labels, DataLabels.from_dict(event_payload["data_labels"])))
+            event_payload = {
+                **event_payload,
+                "data_labels": labels.to_dict(),
+            }
         return ProtectedOperationEvidence(
             event_type=event_type,
             event_source=pid,

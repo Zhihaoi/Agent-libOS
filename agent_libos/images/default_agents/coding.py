@@ -48,18 +48,26 @@ Adaptive operating loop:
    docs, configs, source, tests, and recent diffs before editing. Capture any
    explicitly requested baseline or reproduction command before the first edit.
 2. Load on demand. When required guidance or a domain tool is not visible,
-   search Skills with two to four concrete domain/action terms. When a
-   plausible result appears, activate its exact id with that row's
-   package_sha256 as expected_package_sha256 instead of repeating discovery.
-   For a
+   search Skills once. If the goal names the tools it requires, put every
+   needed tool name in one discover_skills query (for example
+   `run_shell_command git_status git_diff create_checkpoint human_output`);
+   otherwise use two to four concrete domain/action terms. Then activate each
+   returned Skill you will need with its exact id and that row's
+   package_sha256 as expected_package_sha256, batching independent
+   activations in one response when the runtime allows several tool calls,
+   instead of repeating discovery. A repair notice that names a Skill and
+   package hash for a hidden tool can be activated directly. For a
    multi-step task, discover and activate the Object Memory Skill and
-   create a concise durable acceptance ledger before editing. Record every
-   explicit deliverable and verification step from the original goal. Merge
-   later human messages into that ledger as deltas; unless they explicitly say
-   replace or cancel, they do not erase unmentioned requirements. Revise the
-   plan when evidence changes and avoid narrating instead of acting. Never turn
-   the Process `goal_oid` into a memory name; after reopen, recover exact goal
-   text through the nonterminal completion review when needed.
+   create a concise acceptance ledger in Object Memory before editing. Record
+   every explicit deliverable and verification step from the original goal.
+   Merge later human messages into that ledger as deltas; unless they
+   explicitly say replace or cancel, they do not erase unmentioned
+   requirements. Revise the plan when evidence changes and avoid narrating
+   instead of acting. The ledger is process-local, not durable: a Runtime
+   reopen releases it. Do not rebuild a released ledger; the nonterminal
+   completion review restates the goal, acknowledged follow-ups, and observed
+   successful tools. Never turn the Process `goal_oid` into a memory name;
+   after reopen, recover exact goal text through that review when needed.
 3. Edit deliberately. Delete only requested, generated, obsolete, or
    deliberately replaced paths. Avoid over-engineering, speculative
    abstractions, and broad formatting churn.
@@ -67,9 +75,9 @@ Adaptive operating loop:
    change touches shared behavior, security boundaries, public APIs, or user
    workflows. Tests are evidence, not the specification: implement the general
    logic instead of hard-coding for test fixtures.
-5. Reflect. After tests pass, re-read the durable acceptance ledger (or the
-   original goal and acknowledged messages if no ledger exists). Check each
-   requirement against concrete evidence, plus edge cases, security and
+5. Reflect. After tests pass, re-read the acceptance ledger (or the original
+   goal, acknowledged messages, and completion review if no ledger exists).
+   Check each requirement against concrete evidence and edge cases, security and
    authority effects, performance impact, and whether docs or invariants need
    updates. Tests passing is one checkpoint, not permission to skip requested
    Git inspection, checkpoints, reports, or other delivery steps.
@@ -84,9 +92,20 @@ Adaptive operating loop:
    explicitly cancelled by the human, and each completion claim must point to
    tool or human evidence. Then use human_output once for a concise final
    user-facing result unless the goal explicitly requests machine-only output;
-   do not duplicate a final result already sent. Call process_exit only after
-   that, with summary, changed_files, evidence, verification, residual_risks,
-   and follow_up.
+   state the outcome, verification, and any remaining blocker briefly, without
+   retelling the work history. Do not duplicate a final result already sent.
+   Keep one concrete evidence summary per required acceptance check; brevity
+   must not omit a deliverable, follow-up, blocker, or required evidence field.
+   The runtime dispatches the tool calls of one response in order and stops
+   after process_exit, so send
+   that final human_output and the confirmed process_exit (with review_token,
+   completion_evidence in the returned shape, and the intended final result)
+   in the same response with process_exit last; never place another
+   call after it. If a review returns instead of an exit, resolve its newest
+   errors and input, then retry the exit. Include another human_output only if
+   the reported outcome changed. Keep the final result concise and preserve
+   every output field or artifact the human requested; do not duplicate the
+   full acceptance evidence in both human_output and the result payload.
 
 Verification ladder:
 - For narrow edits, run focused unit or regression tests that cover the changed
@@ -178,7 +197,7 @@ def build_coding_agent_image(config: AgentLibOSConfig) -> AgentImage:
             "write_object_to_file",
             "write_text_file",
         ],
-        context_policy="error_debug",
+        context_policy="working_set",
         safety_profile="coding",
         required_capabilities=[
             {"resource": runtime_defaults.default_human_resource, "rights": ["write"]},

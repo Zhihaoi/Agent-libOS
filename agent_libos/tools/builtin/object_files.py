@@ -5,6 +5,7 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from agent_libos.config import DEFAULT_CONFIG
+from agent_libos.tools.contracts import CURRENT_NAMESPACE
 from agent_libos.models.exceptions import ValidationError
 from agent_libos.models import ObjectMetadata, ObjectType, Provenance
 from agent_libos.tools.base import SyncAgentTool, ToolContext, ToolErrorCode, ToolExecutionError, ToolPolicy
@@ -22,7 +23,7 @@ _PROCESS_FILE_PATH_DESCRIPTION = (
 
 class CreateObjectFromFileArgs(BaseModel):
     name: str = Field(description="Namespace-local Object Memory name to create.")
-    namespace: str | None = Field(default=None, description="Object Memory namespace. Defaults to this process namespace.")
+    namespace: str | None = CURRENT_NAMESPACE.field()
     path: str = Field(description=_PROCESS_FILE_PATH_DESCRIPTION)
     encoding: str = Field(default=_TOOL_DEFAULTS.default_text_encoding, description="Text encoding.")
     max_bytes: int = Field(
@@ -46,7 +47,7 @@ class CreateObjectFromFileOutput(BaseModel):
 
 class WriteObjectToFileArgs(BaseModel):
     name: str = Field(description="Namespace-local Object Memory name to resolve and write.")
-    namespace: str | None = Field(default=None, description="Object Memory namespace. Defaults to this process namespace.")
+    namespace: str | None = CURRENT_NAMESPACE.field()
     path: str = Field(description=_PROCESS_FILE_PATH_DESCRIPTION)
     encoding: str = Field(default=_TOOL_DEFAULTS.default_text_encoding, description="Text encoding.")
     overwrite: bool = Field(default=True, description="Whether to overwrite an existing file.")
@@ -59,6 +60,9 @@ class WriteObjectToFileOutput(BaseModel):
     path: str
     bytes_written: int
     created: bool
+    content_sha256: str | None = Field(
+        description="SHA-256 of the exact encoded bytes written to the destination file."
+    )
 
 
 class CreateObjectFromFileTool(SyncAgentTool[CreateObjectFromFileArgs]):
@@ -271,6 +275,7 @@ class WriteObjectToFileTool(SyncAgentTool[WriteObjectToFileArgs]):
             path=result.path,
             bytes_written=result.bytes_written,
             created=result.created,
+            content_sha256=result.content_sha256,
         )
 
     def _extract_text(self, payload: Any) -> str:

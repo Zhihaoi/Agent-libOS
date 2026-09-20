@@ -751,7 +751,11 @@ observed or changed and finalize or retain a conservative unknown outcome.
 
 Conditional text writes are the narrow exception to the preceding state-probe
 rule. A complete `read_text` returns `content_sha256`; truncated reads return no
-token. When `write_text` receives that digest, or the literal `missing`, its
+token. A successful `write_text` also returns the `content_sha256` of the bytes
+it stored, so a follow-up conditional write can reuse it without an intervening
+read. The `write_text_file` tool additionally echoes the stored text and its
+encoding for files within the default complete-read bound, so the model keeps
+the current content in context without reading the file back. When `write_text` receives that digest, or the literal `missing`, its
 pre-mutation state/parent checks are advisory phases that neither disclose
 content nor commit finite authority. A provider-certified content conflict
 therefore abandons the pending intent and restores the write reservation,

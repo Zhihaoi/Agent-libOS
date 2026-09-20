@@ -105,6 +105,10 @@ def evaluate_prompt_cache_release_gate(
 
     uncached_reduction = 1.0 - candidate_uncached / legacy_uncached
     total_reduction = 1.0 - candidate_total / legacy_total
+    legacy_leaks, legacy_leak_categories = _leak_evidence(legacy, required=False)
+    candidate_leaks, candidate_leak_categories = _leak_evidence(
+        candidate, required=True
+    )
     checks: dict[str, bool] = {
         "uncached_input_reduction": (
             uncached_reduction >= thresholds.minimum_uncached_input_reduction
@@ -125,9 +129,14 @@ def evaluate_prompt_cache_release_gate(
         ),
         "legacy_success_rate": _success_rate(legacy) == 1.0,
         "candidate_success_rate": _success_rate(candidate) == 1.0,
-        "forbidden_internal_id_leaks": (
-            _nonnegative_metric(candidate, "forbidden_internal_id_leaks")
-            == 0
+        "forbidden_internal_id_leaks": _forbidden_internal_id_leaks_check(
+            legacy_report,
+            candidate_report,
+            legacy_leaks=legacy_leaks,
+            legacy_categories=legacy_leak_categories,
+            candidate_leaks=candidate_leaks,
+            candidate_categories=candidate_leak_categories,
+            strict_release_evidence=strict_release_evidence,
         ),
     }
     release_evidence = candidate_report.get("release_gates")
@@ -172,6 +181,12 @@ def evaluate_prompt_cache_release_gate(
             "total_input_reduction": total_reduction,
             "legacy_cache_hit_rate": legacy_hit_rate,
             "candidate_cache_hit_rate": candidate_hit_rate,
+            "legacy_forbidden_internal_id_leaks": legacy_leaks,
+            "candidate_forbidden_internal_id_leaks": candidate_leaks,
+            "legacy_forbidden_internal_id_leaks_by_category": legacy_leak_categories,
+            "candidate_forbidden_internal_id_leaks_by_category": (
+                candidate_leak_categories
+            ),
         },
     }
 
@@ -264,6 +279,98 @@ def _provider_integer(row: Mapping[str, Any], key: str) -> int:
     if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
         return value
     return -1
+
+
+_TERMINAL_LEAK_CATEGORY = "terminal_host_identifiers"
+
+
+def _leak_evidence(
+    metrics: Mapping[str, Any],
+    *,
+    required: bool,
+) -> tuple[int | None, dict[str, int] | None]:
+    """Return the reported leak total and its closed-category breakdown.
+
+    The total is mandatory for the candidate arm and optional for the legacy
+    arm (older legacy reports predate the measurement).  A breakdown, when
+    reported, must reconcile with the total; an inconsistent report is rejected
+    rather than read as zero.
+    """
+
+    total_value = metrics.get("forbidden_internal_id_leaks")
+    if total_value is None and not required:
+        return None, None
+    if not _is_nonnegative_integer(total_value):
+        raise ValueError("forbidden_internal_id_leaks must be a non-negative integer")
+    categories_value = metrics.get("forbidden_internal_id_leaks_by_category")
+    if categories_value is None:
+        return total_value, None
+    if not isinstance(categories_value, Mapping) or not all(
+        isinstance(key, str) and _is_nonnegative_integer(count)
+        for key, count in categories_value.items()
+    ):
+        raise ValueError(
+            "forbidden_internal_id_leaks_by_category must map categories to "
+            "non-negative integers"
+        )
+    categories = {key: int(count) for key, count in categories_value.items()}
+    if sum(categories.values()) != total_value:
+        raise ValueError(
+            "forbidden_internal_id_leaks_by_category must reconcile with the leak total"
+        )
+    return total_value, categories
+
+
+def _forbidden_internal_id_leaks_check(
+    legacy_report: Mapping[str, Any],
+    candidate_report: Mapping[str, Any],
+    *,
+    legacy_leaks: int | None,
+    legacy_categories: Mapping[str, int] | None,
+    candidate_leaks: int,
+    candidate_categories: Mapping[str, int] | None,
+    strict_release_evidence: bool,
+) -> bool:
+    """Decide the identifier-leak check for the candidate arm.
+
+    The strict release gate requires a candidate that exposes no forbidden Host
+    identifier at all: that is the promise of the layout being released.  A
+    canary that pairs two arms of the *same* prompt layout is not evaluating
+    that promise; the Host-to-Model projection those arms share is inherited
+    from the layout, not produced by the change under test.  Such a canary
+    still requires zero Model-emitted identifiers (``terminal_host_identifiers``,
+    measured outside the fields the ``process_exit`` contract requires) and no
+    increase in Host-projected identifiers relative to the legacy arm.
+    """
+
+    if candidate_leaks == 0:
+        return True
+    if strict_release_evidence:
+        return False
+    legacy_layout = legacy_report.get("prompt_layout")
+    candidate_layout = candidate_report.get("prompt_layout")
+    same_layout = (
+        isinstance(candidate_layout, str)
+        and bool(candidate_layout.strip())
+        and candidate_layout == legacy_layout
+    )
+    if (
+        not same_layout
+        or legacy_leaks is None
+        or legacy_categories is None
+        or candidate_categories is None
+    ):
+        return False
+    candidate_terminal = candidate_categories.get(_TERMINAL_LEAK_CATEGORY, 0)
+    legacy_terminal = legacy_categories.get(_TERMINAL_LEAK_CATEGORY, 0)
+    return (
+        candidate_terminal == 0
+        and candidate_leaks - candidate_terminal <= legacy_leaks - legacy_terminal
+    )
+
+
+def _is_nonnegative_integer(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
 
 
 def _known_provider_prices_accounted(report: Mapping[str, Any]) -> bool:

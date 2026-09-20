@@ -116,8 +116,9 @@ inventory.
 
 LLM requests are also formal bidirectional protected provider operations. Their
 Sink is `llm:<profile>` and profile/model/base-URL/API-mode plus effective
-provider retention policy (`store`, prompt-cache retention, and Responses
-continuation policy) is hashed into the trusted identity. Precheck and client
+provider policy (`store`, reasoning context/effort, replay, prompt layout,
+prompt-cache retention, and Responses continuation policy) is hashed into the
+trusted identity. Precheck and client
 construction use one frozen Host snapshot, so an already-cached client cannot
 drift from the identity being authorized. The returned provider content is
 treated as unclassified `normal/untrusted` input and cannot lower the request
@@ -201,6 +202,49 @@ iterator, count, or size violation fails the completion closed through the same
 text-free `LLMError` boundary; oversized provider content is not truncated into
 an apparently valid model action.
 
+### OpenAI Responses and private reasoning replay
+
+Official OpenAI profiles without an explicit model use `gpt-6-astra`; the
+default `auto` API selects Responses with `store=false`, medium reasoning
+effort, and all-turns reasoning context. Astra sampling options are filtered
+before dispatch. The minimum OpenAI SDK version is `2.52.0`. Explicit model
+selection remains authoritative, and custom endpoints retain their compatible
+provider defaults. See [configuration precedence and replay
+settings](configuration.md#responses-reasoning-and-local-replay).
+
+Replay keeps the exact ordered Responses items, including encrypted reasoning,
+assistant `phase`, function-call identities, and paired outputs. It sends local
+history with no server response-id chaining. Unsupported replay shapes and
+protocol errors fail explicitly rather than dropping reasoning or falling back
+to Chat. The encrypted state lives in separate bounded local rows; ordinary
+call records and provider traces contain safe observations only. Retained
+reasoning usage is an output-token subset, so it is not charged again.
+
+The Host commits replay progress at action-validation and tool-result safety
+points. Durable waits and recovery reuse that progress; they do not treat a
+provider summary as resumable state. Checkpoints store scoped local references,
+and image exports omit this conversation state. Purge invalidates retained
+references. Full-I/O retention must be enabled for durable replay, and schema-v7
+stores require the offline [schema-v8 migration](storage.md).
+
+A committed `exec` starts a fresh private conversation for the current image
+and goal while preserving retained checkpoint payloads. Its publication receipt
+binds the retired provider call, so the exec tool result can still be recorded;
+failed exec leaves the previous replay head intact. Ordinary Host context
+appends advance only the matching prior context source reference in the same
+transaction as the Object update. Current READ authority, historical labels,
+and exact version checks for all other sources remain required.
+
+On restart, only owners with private histories or frozen release requests need
+replay profile resolution; unrelated pending waits do not depend on old profiles.
+The Host validates retained private histories and frozen release
+requests before releasing lost volatile Object payloads. For their exact source
+Objects, recovery preserves only existing active READ grants and READ policy
+restrictions, with all other rights and delegation removed. This keeps historical
+source reauthorization possible without reviving revoked authority or Object
+payloads. User revocation before or after restart remains effective. Disabling
+full-I/O retention also disables this authority preservation.
+
 ### Prompt caching v2 release evidence
 
 Prompt caching has a model-visible layout and a provider transport policy.
@@ -211,10 +255,19 @@ default and rollback layout during the profile opt-in canary; switch the default
 only after the paired release gate passes. `prompt_cache_mode=provider_default`
 sends no v2 cache options;
 `implicit` sends request-wide implicit mode, while `explicit` also places one
-stable text breakpoint. Both opt-in modes require `prompt_cache_key`; the
+stable text breakpoint. Explicitly selecting either mode requires
+`prompt_cache_key`; the
 wire key is derived from provider, model, Image/stable-prefix, tool fingerprint,
 and the configured privacy domain without a Run or process id. The only v2 TTL
 is `30m`, and it is mutually exclusive with legacy `prompt_cache_retention`.
+Host-selected `prompt_layout: auto` and `prompt_cache_mode: auto` expose the
+official-endpoint candidate: v2 layout, implicit mode, and `30m` TTL. Auto cache
+requests mark the stable Host instruction prefix with an explicit breakpoint.
+Auto cache mode creates an isolated profile privacy domain when no explicit key is set;
+that domain lasts for one registry lifetime. Explicit keys allow cross-restart
+reuse. Custom endpoints resolve auto to legacy layout and provider-default
+caching. These candidate settings do not change the checked-in defaults and
+are not evidence that the live paired gate passed.
 See the [OpenAI prompt-caching guide](https://developers.openai.com/api/docs/guides/prompt-caching).
 
 The repository-maintenance
@@ -286,6 +339,25 @@ repetitions and six workflows per provider, all oracles and completion evidence,
 the deterministic security flag, zero forbidden identifiers, the token
 reduction thresholds, non-regressing hit rate, and non-increasing known-price
 cost per successful task.
+
+Forbidden-identifier evidence counts Host identifiers in the Host-to-Model
+projection and in the Model's `human_output` and `process_exit` arguments. The
+`process_exit` scan excludes only the fields whose values the tool contract
+itself requires to be Host identifiers: `result_oid`, and under cumulative exit
+review `completion_evidence.goal_oid`, `reviewed_message_ids`, and each
+acceptance check's `source_refs`. Copying an id into the field that exists to
+carry it is the contract, not a leak; every other field (`message`, `payload`,
+`requirement`, `evidence_summary`, `final_verification`, ...) is scanned in full,
+string-encoded evidence is decoded at the same positions the Runtime decodes it,
+and arguments that are not a JSON object are scanned whole. The gate result's
+`metrics` include the candidate and legacy leak totals and their closed-category
+breakdown so a failure shows whether the ids came from the Host projection
+(`completion_binding_fields`, `host_contract_fields`, ...) or from Model output
+(`terminal_host_identifiers`). The strict gate always requires a zero candidate
+total. A `--canary` comparison whose two arms share the same `prompt_layout` is
+not evaluating that layout's promise, so it requires zero Model-emitted
+identifiers and no increase in Host-projected identifiers relative to the
+legacy arm instead; a canary across layouts still requires zero.
 
 Explicit cache policy fields are dispatched to the Host-selected OpenAI-compatible
 endpoint, including a custom base URL. If the endpoint rejects a v2 cache field,
