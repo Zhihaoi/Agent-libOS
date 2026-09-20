@@ -612,34 +612,49 @@ The Host starts and owns the daemon lifecycle (`agentvfs workspace init` /
 `start`); the module only attaches. Binding is Host-only composition: set the
 substrate attribute `agentvfs` to a workspace name (or a mapping with
 `workspace` and an optional explicit `socket`) before `Runtime.open`. The
-startup hook discovers the running workspace through its `session.json` and
-fails closed when it is not running; without a binding the module loads inert
-and every tool call fails closed. The model can never supply a socket path or
-workspace name.
+startup hook discovers the workspace through its `session.json` and fails
+closed unless the session reports `started`; connection failures are surfaced
+when a tool contacts the daemon. A bound workspace requires Python AF_UNIX
+support. Without a binding the module loads inert on every platform and every
+tool call fails closed. The model can never supply a socket path or workspace
+name.
 
 Tools enforce capability authority on `agentvfs:<workspace>` before any
 socket traffic: `read` for status, `write` for checkpoint, and the stronger
 `admin` for the destructive rollback, mirroring checkpoint-restore authority.
-Denials and operations are audited as `module.agentvfs.*` actions.
+Denials and operations are audited as `module.agentvfs.*` actions. Calls use the
+protected-operation SDK to reserve and settle finite-use capabilities and record
+external effects. A connection failure before sending a command returns the
+reserved use; a failure after a send attempt keeps it consumed because the
+daemon may already have changed state. Filesystem mutations remain external
+effects: ordinary libOS checkpoint restore does not undo them automatically.
 
 Both mutating tools accept `pair_libos` to couple the two state planes. A
 paired checkpoint additionally creates a libOS checkpoint (requiring the
 process's `checkpoint:process:<pid>` write right, probed before any socket
 traffic) and records the agentvfs workspace, label, and commit in the libOS
 checkpoint's metadata. A paired rollback requires an explicit
-`libos_checkpoint_id`, validates the pairing by exact commit equality after
-the filesystem rollback, and then attempts the process-authorized libOS
-restore. Because the scheduler holds its run lock across every tool quantum,
+`libos_checkpoint_id` and validates its owner, workspace, stored commit, and
+target before any filesystem rollback. The target must be the saved label or
+commit; the daemon receives the immutable saved commit so moving a label cannot
+select a different snapshot. Its response must match that commit before the
+process-authorized libOS restore is attempted. Because the scheduler holds its
+run lock across every tool quantum,
 an in-quantum restore is refused by design; the tool then reports
 `libos_restore=pending_host_restore` with a Host hint (audited as
 `module.agentvfs.libos_restore_pending`), and the Host completes
 `CheckpointManager.restore` once the process is quiescent. With Host-granted
 checkpoint admin and an idle scheduler, both planes restore inside the one
-tool call.
+tool call. Restore warnings and pending reconciliation remain visible in the
+result instead of being reported as full success. Pairing records an association,
+not an atomic transaction across both systems: the Host must coordinate workspace
+writers and finish any pending restore before resuming work.
 
-Tests live in `tests/security/test_agentvfs_module.py` and run against an
-in-process fake control daemon, so they need neither FUSE nor an agentvfs
-binary. Real-daemon end-to-end drivers live in the agentvfs repository under
+Tests in `tests/security/test_agentvfs_*.py` use an in-process fake control daemon
+and need neither FUSE nor an agentvfs binary. Socket integration cases are skipped
+where AF_UNIX is unavailable; unsupported-platform and binding validation tests
+still run there. Real-daemon end-to-end drivers live in the agentvfs repository
+under
 `extensions/agent-libos/`.
 
 ## CLI

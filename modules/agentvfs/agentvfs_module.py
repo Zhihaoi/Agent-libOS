@@ -14,9 +14,9 @@ Paired mode gives one tool call two-plane semantics. A paired checkpoint
 snapshots the agentvfs filesystem first, then records a libOS checkpoint whose
 metadata embeds the agentvfs commit hash (order forced by the metadata), after
 probing the process's self-checkpoint authority so a denial leaves no orphan
-on either plane. A paired rollback rolls the filesystem back first, validates
-the named libOS checkpoint pairs with the resulting commit, then attempts the
-legitimate in-tool restore (``CheckpointManager.restore`` refuses while the
+on either plane. A paired rollback validates the named libOS checkpoint and
+workspace first, rolls the filesystem back to its immutable commit, then attempts
+the legitimate in-tool restore (``CheckpointManager.restore`` refuses while the
 scheduler runs a quantum, so a model-invoked call reports
 ``libos_restore=pending_host_restore`` with a Host hint instead of bypassing
 quiescence; a Host-driven call with admin authority restores both planes).
@@ -25,6 +25,7 @@ quiescence; a Host-driven call with admin authority restores both planes).
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import socket
@@ -34,8 +35,24 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
-from agent_libos.models import AgentImage, CapabilityRight, EventType
+from agent_libos.models import (
+    AgentImage,
+    CapabilityDecision,
+    CapabilityRight,
+    EventType,
+    ExternalEffectClassification,
+    ExternalEffectRollbackClass,
+    ExternalEffectRollbackStatus,
+)
 from agent_libos.models.exceptions import CapabilityDenied, ValidationError
+from agent_libos.sdk import (
+    ProtectedOperationContract,
+    ProtectedOperationEvidence,
+    ProtectedOperationInvocation,
+    ProviderPhase,
+    ResourcePolicy,
+)
+from agent_libos.substrate import ProviderEffectNotStarted
 from agent_libos.tools.base import (
     SyncAgentTool,
     ToolContext,
@@ -50,6 +67,7 @@ _WORKSPACE_NAME = re.compile(r"^[A-Za-z0-9._-]{1,80}$")
 MODULE_ID = "agent-libos-agentvfs:v0"
 
 LIBOS_RESTORE_RESTORED = "restored"
+LIBOS_RESTORE_WARNINGS = "restored_with_warnings"
 LIBOS_RESTORE_PENDING = "pending_host_restore"
 LIBOS_RESTORE_SKIPPED = "skipped"
 _RESTORE_REFUSED_PREFIX = "refused while scheduler"
@@ -75,10 +93,22 @@ class AgentVfsControlClient:
         self.socket_path = str(socket_path)
         self.timeout_s = timeout_s
 
-    def request(self, line: str) -> dict[str, Any]:
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+    def _connect(self) -> socket.socket:
+        sock = None
+        try:
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             sock.settimeout(self.timeout_s)
             sock.connect(self.socket_path)
+        except (OSError, ValueError, AttributeError) as exc:
+            if sock is not None:
+                sock.close()
+            # No command bytes have been sent, so the provider cannot have
+            # changed state and reserved authority can safely be returned.
+            raise ProviderEffectNotStarted("agentvfs control connection failed") from exc
+        return sock
+
+    def request(self, line: str) -> dict[str, Any]:
+        with self._connect() as sock:
             sock.sendall((line + "\n").encode())
             buffer = bytearray()
             while not buffer.endswith(b"\n"):
@@ -93,9 +123,16 @@ class AgentVfsControlClient:
             response = json.loads(text)
         except ValueError as exc:
             raise AgentVfsControlError(line, f"invalid JSON reply: {text!r}") from exc
-        if not isinstance(response, dict) or not response.get("ok"):
+        if not isinstance(response, dict) or response.get("ok") is not True:
             detail = response.get("error") if isinstance(response, dict) else text
             raise AgentVfsControlError(line, str(detail))
+        result_field = {"checkpoint": "commit", "rollback": "rolled_back_to"}.get(
+            line.split(" ", 1)[0]
+        )
+        if result_field is not None:
+            commit = response.get(result_field)
+            if not isinstance(commit, str) or re.fullmatch(r"[0-9a-f]{64}", commit) is None:
+                raise AgentVfsControlError(line, f"invalid {result_field} in reply")
         return response
 
 
@@ -123,12 +160,21 @@ def _coerce_binding(value: Any) -> AgentVfsBinding:
                 if hasattr(value, field_name)
             }
         )
-    if not _WORKSPACE_NAME.fullmatch(binding.workspace):
+    if (
+        not isinstance(binding.workspace, str)
+        or binding.workspace in {".", ".."}
+        or not _WORKSPACE_NAME.fullmatch(binding.workspace)
+    ):
         raise ValidationError(
             f"agentvfs workspace name {binding.workspace!r} must match [A-Za-z0-9._-]{{1,80}}"
         )
-    if binding.request_timeout_s <= 0:
-        raise ValidationError("agentvfs request_timeout_s must be positive")
+    if (
+        isinstance(binding.request_timeout_s, bool)
+        or not isinstance(binding.request_timeout_s, (int, float))
+        or not math.isfinite(binding.request_timeout_s)
+        or binding.request_timeout_s <= 0
+    ):
+        raise ValidationError("agentvfs request_timeout_s must be finite and positive")
     return binding
 
 
@@ -150,8 +196,14 @@ def _discover_socket(binding: AgentVfsBinding) -> str:
             f"agentvfs workspace {binding.workspace!r} is not attachable: "
             f"cannot read session file {session_path}"
         ) from exc
+    if not isinstance(record, dict):
+        raise ValidationError("agentvfs session file must contain a JSON object")
     socket_path = record.get("socket")
-    if record.get("status") != "started" or not socket_path:
+    if (
+        record.get("status") != "started"
+        or not isinstance(socket_path, str)
+        or not socket_path
+    ):
         raise ValidationError(
             f"agentvfs workspace {binding.workspace!r} is not running "
             f"(session status={record.get('status')!r})"
@@ -169,8 +221,22 @@ class AgentVfsAdapter:
         self.client = AgentVfsControlClient(
             _discover_socket(binding), timeout_s=binding.request_timeout_s
         )
+        for operation in ("status", "checkpoint", "rollback"):
+            host.protected_operations.register_contract(
+                ProtectedOperationContract(
+                    name=f"module.agentvfs.{operation}",
+                    provider="agentvfs",
+                    operation=operation,
+                    evidence_roles=("audit", "event", "effect"),
+                    resource_policy=ResourcePolicy.NONE,
+                    state_mutation=operation != "status",
+                    information_flow=True,
+                )
+            )
 
-    def _require_right(self, pid: str, right: CapabilityRight, operation: str) -> None:
+    def _require_right(
+        self, pid: str, right: CapabilityRight, operation: str
+    ) -> CapabilityDecision:
         decision = self.host.capability.authorize(pid, self.resource, right)
         if not decision.allowed:
             self.host.audit.record(
@@ -182,38 +248,79 @@ class AgentVfsAdapter:
             raise CapabilityDenied(
                 f"{pid} denied agentvfs {operation} on {self.resource}: {decision.reason}"
             )
+        return decision
 
-    def _record(self, pid: str, operation: str, event_type: EventType) -> None:
-        self.host.audit.record(
+    def classify_external_effect(
+        self, operation: str, context: dict[str, Any], result: Any
+    ) -> ExternalEffectClassification:
+        mutates = operation != "status"
+        return ExternalEffectClassification(
+            rollback_class=(
+                ExternalEffectRollbackClass.IRREVERSIBLE
+                if mutates
+                else ExternalEffectRollbackClass.NO_ROLLBACK_REQUIRED
+            ),
+            rollback_status=(
+                ExternalEffectRollbackStatus.NOT_SUPPORTED
+                if mutates
+                else ExternalEffectRollbackStatus.NOT_REQUIRED
+            ),
+            state_mutation=mutates,
+            information_flow=True,
+            metadata={"workspace": self.binding.workspace, "operation": operation},
+        )
+
+    def _request(
+        self, pid: str, operation: str, right: CapabilityRight, argument: str | None = None
+    ) -> dict[str, Any]:
+        decision = self._require_right(pid, right, operation)
+        context = {"workspace": self.binding.workspace, "operation": operation}
+        canonical_args = dict(context)
+        if argument is not None:
+            canonical_args["argument"] = argument
+        invocation = ProtectedOperationInvocation(
+            pid=pid,
             actor=pid,
-            action=f"module.agentvfs.{operation}",
             target=self.resource,
-            decision={"workspace": self.binding.workspace, "operation": operation},
+            decisions=(decision,),
+            canonical_args=canonical_args,
+            observation=context,
         )
-        self.host.events.emit(
-            event_type,
-            source=pid,
-            target=self.resource,
-            payload={"workspace": self.binding.workspace, "operation": operation},
-        )
+        mutates = operation != "status"
+        line = operation if argument is None else f"{operation} {argument}"
+        with self.host.protected_operations.start(
+            f"module.agentvfs.{operation}", invocation, provider=self
+        ) as protected:
+            response = protected.call(
+                ProviderPhase(operation, state_mutation=mutates, information_flow=True),
+                self.client.request,
+                line,
+            )
+            evidence = ProtectedOperationEvidence(
+                event_type=EventType.EXTERNAL_WRITE if mutates else EventType.EXTERNAL_READ,
+                event_source=pid,
+                event_target=self.resource,
+                event_payload=context,
+                audit_action=f"module.agentvfs.{operation}",
+                audit_actor=pid,
+                audit_target=self.resource,
+                audit_decision=context,
+            )
+            return protected.complete(
+                response,
+                evidence,
+                classification_context=context,
+                classification_result=response,
+            )
 
     def status(self, pid: str) -> dict[str, Any]:
-        self._require_right(pid, CapabilityRight.READ, "status")
-        response = self.client.request("status")
-        self._record(pid, "status", EventType.EXTERNAL_READ)
-        return response
+        return self._request(pid, "status", CapabilityRight.READ)
 
     def checkpoint(self, pid: str, label: str) -> dict[str, Any]:
-        self._require_right(pid, CapabilityRight.WRITE, "checkpoint")
-        response = self.client.request(f"checkpoint {label}")
-        self._record(pid, "checkpoint", EventType.EXTERNAL_WRITE)
-        return response
+        return self._request(pid, "checkpoint", CapabilityRight.WRITE, label)
 
     def rollback(self, pid: str, target: str) -> dict[str, Any]:
-        self._require_right(pid, CapabilityRight.ADMIN, "rollback")
-        response = self.client.request(f"rollback {target}")
-        self._record(pid, "rollback", EventType.EXTERNAL_WRITE)
-        return response
+        return self._request(pid, "rollback", CapabilityRight.ADMIN, target)
 
     def detach(self) -> bool:
         """Shutdown finalizer: release module state without stopping the daemon."""
@@ -235,6 +342,8 @@ def initialize_agentvfs(runtime: Any) -> None:
         # closed at call time because no socket path exists to talk to.
         runtime.set_runtime_attribute(_ADAPTER_ATTR, _UNBOUND)
         return
+    if not hasattr(socket, "AF_UNIX"):
+        raise ValidationError("agentvfs requires Unix-domain socket support (AF_UNIX)")
     binding = _coerce_binding(binding_value)
     adapter = AgentVfsAdapter(runtime, binding)
     runtime.set_runtime_attribute(_ADAPTER_ATTR, adapter)
@@ -324,9 +433,13 @@ def _create_paired_libos_checkpoint(
 
 
 def _inspect_paired_checkpoint(
-    runtime: Any, pid: str, checkpoint_id: str
+    runtime: Any,
+    pid: str,
+    checkpoint_id: str,
+    workspace: str,
+    target: str,
 ) -> dict[str, Any]:
-    """Load the paired checkpoint's metadata before any socket traffic."""
+    """Validate the complete pair before issuing a destructive socket request."""
     inspected = runtime.checkpoint.inspect(checkpoint_id, actor=pid)
     summary = inspected["checkpoint"]
     if summary["pid"] != pid:
@@ -334,7 +447,28 @@ def _inspect_paired_checkpoint(
             f"paired libOS checkpoint {checkpoint_id} belongs to "
             f"{summary['pid']}, not {pid}"
         )
-    return summary.get("metadata") or {}
+    metadata = summary.get("metadata") or {}
+    if metadata.get("agentvfs_workspace") != workspace:
+        raise ValidationError(
+            f"paired libOS checkpoint {checkpoint_id} does not belong to "
+            f"agentvfs workspace {workspace}"
+        )
+    commit = metadata.get("agentvfs_commit")
+    if not isinstance(commit, str) or re.fullmatch(r"[0-9a-f]{64}", commit) is None:
+        raise ValidationError(
+            f"paired libOS checkpoint {checkpoint_id} has no valid agentvfs commit"
+        )
+    label = metadata.get("agentvfs_label")
+    if not isinstance(label, str) or _WORKSPACE_NAME.fullmatch(label) is None:
+        raise ValidationError(
+            f"paired libOS checkpoint {checkpoint_id} has no valid agentvfs label"
+        )
+    if target not in {label, commit}:
+        raise ValidationError(
+            f"agentvfs target {target} does not identify paired libOS "
+            f"checkpoint {checkpoint_id}; use its label {label} or commit {commit}"
+        )
+    return metadata
 
 
 def _require_commit_pairing(
@@ -349,11 +483,18 @@ def _require_commit_pairing(
         )
 
 
+@dataclass(frozen=True)
+class _LibosRestoreOutcome:
+    status: str
+    hint: str | None = None
+    reconciliation_pending: bool = False
+    publication_id: str | None = None
+
+
 def _restore_libos_paired(
     runtime: Any, pid: str, workspace: str, checkpoint_id: str
-) -> tuple[str, str | None]:
-    """Attempt the process-authorized libOS restore, or report a pending Host
-    restore when authority or scheduler quiescence is missing."""
+) -> _LibosRestoreOutcome:
+    """Preserve both admission refusals and committed-but-pending restores."""
     decision = runtime.capability.authorize(
         pid, f"checkpoint:{checkpoint_id}", CapabilityRight.ADMIN
     )
@@ -366,7 +507,7 @@ def _restore_libos_paired(
             runtime, pid, workspace, checkpoint_id, "authority", hint
         )
     try:
-        runtime.checkpoint.restore(pid, checkpoint_id)
+        result = runtime.checkpoint.restore(pid, checkpoint_id)
     except ValidationError as exc:
         if _RESTORE_REFUSED_PREFIX in str(exc):
             hint = f"{_HOST_RESTORE_HINT}; scheduler refused the in-tool restore: {exc}"
@@ -374,7 +515,17 @@ def _restore_libos_paired(
                 runtime, pid, workspace, checkpoint_id, "scheduler_busy", hint
             )
         raise
-    return LIBOS_RESTORE_RESTORED, None
+    status = str(result["status"])
+    pending = bool(result["reconciliation_pending"])
+    publication_id = str(result["publication_id"])
+    hint = None
+    if pending or status == LIBOS_RESTORE_WARNINGS:
+        hint = (
+            "libOS main state was committed but restore reconciliation is pending; "
+            f"the Host must complete startup recovery for publication {publication_id} "
+            "before resuming. Do not repeat the filesystem rollback."
+        )
+    return _LibosRestoreOutcome(status, hint, pending, publication_id)
 
 
 def _pending_restore(
@@ -384,14 +535,14 @@ def _pending_restore(
     checkpoint_id: str,
     reason: str,
     hint: str,
-) -> tuple[str, str | None]:
+) -> _LibosRestoreOutcome:
     runtime.audit.record(
         actor=pid,
         action="module.agentvfs.libos_restore_pending",
         target=f"checkpoint:{checkpoint_id}",
         decision={"reason": reason, "workspace": workspace},
     )
-    return LIBOS_RESTORE_PENDING, hint
+    return _LibosRestoreOutcome(LIBOS_RESTORE_PENDING, hint)
 
 
 class AgentvfsStatusArgs(BaseModel):
@@ -433,14 +584,15 @@ class AgentvfsCheckpointOutput(BaseModel):
 
 class AgentvfsRollbackArgs(BaseModel):
     target: str = Field(
-        description="Rollback target: a checkpoint label or 64-hex commit hash."
+        description="Rollback target: a checkpoint label or 64-hex commit hash. In paired mode, "
+        "must match the paired checkpoint label or commit; its immutable commit is restored."
     )
     pair_libos: bool = Field(
         default=False,
         description=(
-            "Validate the named paired libOS checkpoint (its metadata must embed the "
-            "commit actually rolled back to) and attempt its restore after the "
-            "filesystem rollback. The libOS restore is Host-mediated when the process "
+            "Validate the named paired libOS checkpoint, workspace, and target before "
+            "rolling back to its immutable filesystem commit, then attempt its libOS "
+            "restore. The libOS restore is Host-mediated when the process "
             "lacks checkpoint admin authority or the scheduler is running; the result "
             "then reports libos_restore=pending_host_restore with a hint instead of "
             "restoring in-tool."
@@ -456,11 +608,19 @@ class AgentvfsRollbackOutput(BaseModel):
     rolled_back_to: str
     paired_libos_checkpoint_id: str | None = None
     libos_restore: str = Field(
-        description="restored | pending_host_restore | skipped (non-paired rollback)."
+        description="restored | restored_with_warnings | pending_host_restore | skipped (non-paired rollback)."
     )
     libos_restore_hint: str | None = Field(
         default=None,
-        description="Present when libos_restore=pending_host_restore: what the Host must run.",
+        description="Present when the Host must finish restore or recovery.",
+    )
+    libos_reconciliation_pending: bool = Field(
+        default=False,
+        description="True when libOS main state committed but startup recovery is required.",
+    )
+    libos_publication_id: str | None = Field(
+        default=None,
+        description="The libOS restore publication, including one awaiting reconciliation.",
     )
 
 
@@ -539,8 +699,9 @@ class AgentvfsRollbackTool(SyncAgentTool[AgentvfsRollbackArgs]):
         "Roll the process's agentvfs workspace filesystem back to a checkpoint "
         "label or commit hash, restoring deleted and overwritten files. "
         "Destructive: requires the stronger agentvfs admin capability. With "
-        "pair_libos=true it validates and attempts to restore the paired libOS "
-        "checkpoint (libOS object/SQL state) as well; when the in-tool libOS "
+        "pair_libos=true it validates the checkpoint workspace and target before "
+        "restoring the paired immutable filesystem commit and libOS object/SQL state. "
+        "When the in-tool libOS "
         "restore is not permitted (missing checkpoint admin authority) or is "
         "refused while the scheduler runs, the filesystem rollback still stands "
         "and the result reports libos_restore=pending_host_restore so the Host "
@@ -572,18 +733,26 @@ class AgentvfsRollbackTool(SyncAgentTool[AgentvfsRollbackArgs]):
             )
         runtime = _runtime(ctx)
         paired_metadata = _inspect_paired_checkpoint(
-            runtime, ctx.pid, args.libos_checkpoint_id
+            runtime,
+            ctx.pid,
+            args.libos_checkpoint_id,
+            adapter.binding.workspace,
+            target,
         )
-        rolled_to = str(adapter.rollback(ctx.pid, target)["rolled_back_to"])
+        rolled_to = str(
+            adapter.rollback(ctx.pid, paired_metadata["agentvfs_commit"])["rolled_back_to"]
+        )
         _require_commit_pairing(paired_metadata, args.libos_checkpoint_id, rolled_to)
-        restore_status, hint = _restore_libos_paired(
+        restore = _restore_libos_paired(
             runtime, ctx.pid, adapter.binding.workspace, args.libos_checkpoint_id
         )
         return AgentvfsRollbackOutput(
             rolled_back_to=rolled_to,
             paired_libos_checkpoint_id=args.libos_checkpoint_id,
-            libos_restore=restore_status,
-            libos_restore_hint=hint,
+            libos_restore=restore.status,
+            libos_restore_hint=restore.hint,
+            libos_reconciliation_pending=restore.reconciliation_pending,
+            libos_publication_id=restore.publication_id,
         )
 
 

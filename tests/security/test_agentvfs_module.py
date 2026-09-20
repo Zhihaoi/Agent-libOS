@@ -144,6 +144,9 @@ def _flatten(error: BaseException) -> str:
     return str(error)
 
 
+@pytest.mark.skipif(
+    not hasattr(socket, "AF_UNIX"), reason="agentvfs control daemon requires AF_UNIX"
+)
 class TestAgentVfsModule:
 
     def setup_method(self) -> None:
@@ -415,7 +418,7 @@ class TestAgentVfsModule:
         assert rolled.payload["paired_libos_checkpoint_id"] == checkpoint_id
         assert rolled.payload["libos_restore"] == "pending_host_restore"
         assert rolled.payload["libos_restore_hint"]
-        assert self._fake.received == ["checkpoint c1", "rollback c1"]
+        assert self._fake.received == ["checkpoint c1", f"rollback {COMMIT_B}"]
 
         restored = runtime.checkpoint.restore(
             "test", checkpoint_id, require_capability=False
@@ -473,7 +476,7 @@ class TestAgentVfsModule:
             == {"version": 1}
         )
 
-    def test_paired_rollback_rejects_commit_mismatch_after_filesystem_rollback(
+    def test_paired_rollback_rejects_target_mismatch_before_filesystem_rollback(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         runtime = self._open_runtime(monkeypatch)
@@ -499,8 +502,7 @@ class TestAgentVfsModule:
             code="validation_error",
             error_type="ValidationError",
         )
-        # The filesystem rollback stands; the daemon saw the mismatched target.
-        assert self._fake.received == ["checkpoint c1", "rollback c2"]
+        assert self._fake.received == ["checkpoint c1"]
 
     def test_paired_rollback_requires_checkpoint_id_argument(
         self, monkeypatch: pytest.MonkeyPatch

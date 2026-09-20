@@ -14,7 +14,7 @@ provides:
   provider_hooks: []
   startup_hooks:
     - initialize_agentvfs
-sha256: f9e331b9ae6f965929b13d17336b6b97ccb31f2e73c043caf29bf8774ab0c464
+sha256: 7b884cf5119701f4f2d9edca7da5df4145ab317ade5e134a8b4451fc628d941c
 metadata:
   owner: local
   external_effects:
